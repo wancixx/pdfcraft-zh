@@ -29,7 +29,7 @@ Nothing is redistributed by the patch repository except the files listed under
 | ocrs-cjk engine | MIT OR Apache-2.0 | Keep the copyright and licence | Compiled in as a Cargo dependency. Its licence is the same MIT/Apache-2.0 pair already shipped for PdfCraft |
 | PdfCraft application icon | MIT OR Apache-2.0 | Keep the copyright and licence; indicate modification | `licenses/ICON.txt` states the origin and the one change made (a CJK badge was composited onto each size) |
 
-## Points that commonly go wrong
+## Points worth noting
 
 ### Trademarks
 

@@ -156,7 +156,7 @@ index 84801d5..5c872ac 100644
  fn stream_data(doc: &Document, object: Option<&Object>) -> Option<Vec<u8>> {
      match doc.resolve(object?).as_ref() {
 diff --git a/crates/ocr/Cargo.toml b/crates/ocr/Cargo.toml
-index 46bb3a1..cd8ef28 100644
+index 46bb3a1..eb00fca 100644
 --- a/crates/ocr/Cargo.toml
 +++ b/crates/ocr/Cargo.toml
 @@ -1,3 +1,7 @@
@@ -173,7 +173,7 @@ index 46bb3a1..cd8ef28 100644
  pdfcraft-fonts = { workspace = true }
 -ocrs = { version = "0.13.1", default-features = false, features = ["rten"] }
 -rten = { version = "0.26.0", default-features = false, features = ["rten_format"] }
-+ocrs-cjk = { path = "/Users/wangjunwei/Desktop/pdfcraft-zh-assets/ocrs-cjk/ocrs", default-features = false, features = ["onnx"] }
++ocrs-cjk = { path = "../../../vendor/ocrs-cjk/ocrs", default-features = false, features = ["onnx"] }
 +rten = { version = "0.26.0", default-features = false, features = ["rten_format", "onnx_format"] }
  thiserror.workspace = true
 diff --git a/crates/ocr/src/lib.rs b/crates/ocr/src/lib.rs
