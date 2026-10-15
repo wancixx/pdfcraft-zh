@@ -18,3 +18,7 @@ __pycache__/
 /craft-fonts/
 /vendor/
 /dist/
+
+# macOS Finder duplicate copies ("name 2.ext" from a copy-paste collision)
+* 2.*
+* 2
