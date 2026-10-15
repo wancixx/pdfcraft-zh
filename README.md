@@ -133,10 +133,15 @@ unreachable from many networks, so our script looks in this order:
 
 ### Source repositories
 
-The GitHub repositories (PdfCraft source, craft-fonts, ocrs-cjk) go through the
-`ghfast.top` accelerator by default. If that fails, clone them yourself into the
-working directory (`pdfcraft/`, `craft-fonts/`, `vendor/ocrs-cjk/`); the script
-reuses anything it finds.
+The three GitHub repositories (PdfCraft source, craft-fonts, ocrs-cjk) are fetched
+through a list of mirrors, trying each in turn. Two routes are used per mirror:
+GitHub's archive tarball (a single resumable HTTP GET) and a shallow `git fetch`.
+A failed attempt is cleaned up before the next one starts, so re-running the
+script always works — it never gets stuck on a half-written directory.
+
+If every mirror fails, the script prints the exact commands to fetch by hand. Put
+the result at `pdfcraft/`, `craft-fonts/` or `vendor/ocrs-cjk/` in the working
+directory and run it again; anything already present is reused.
 
 ## Why the upstream revision is pinned
 

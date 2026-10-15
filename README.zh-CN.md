@@ -119,9 +119,12 @@ SHA256  13d0dda27d63dc0f4938af48df2c55b33f3c989a0bd5eacb8410e30f1735f644
 
 ### 源码仓库
 
-GitHub（PdfCraft 源码、craft-fonts、ocrs-cjk）默认走 `ghfast.top` 加速。
-如遇问题，可自行 clone 到工作目录下的对应位置（`pdfcraft/`、`craft-fonts/`、
-`vendor/ocrs-cjk/`），脚本检测到已存在便会复用。
+三个 GitHub 仓库（PdfCraft 源码、craft-fonts、ocrs-cjk）会依次尝试多个加速镜像。
+每个镜像下先试 GitHub 的打包下载（一次 HTTP GET，支持断点续传），失败再试 `git` 浅取。
+每次失败的残留都会被清干净，所以重跑一定能继续 —— 不会卡在半成品目录上。
+
+如果所有镜像都不通，脚本会打印出可直接复制的手动下载命令。把结果放到工作目录下对应的
+位置（`pdfcraft/`、`craft-fonts/`、`vendor/ocrs-cjk/`）再重新运行即可，已存在的会被复用。
 
 ## 为什么固定 upstream 版本
 

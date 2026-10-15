@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -45,18 +46,28 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 # The patch is verified against this upstream commit; checking it out guarantees it applies
-UPSTREAM_REPO = "https://github.com/storytold/pdfcraft"
+# Repositories are stored as owner/repo: fetch_repo() adds the mirror prefix and
+# github.com itself, so a full URL here would be spliced in twice.
+UPSTREAM_REPO = "storytold/pdfcraft"
 UPSTREAM_COMMIT = "afa8e1843cfed613f3d403119f6c2649bce824c9"
 
-FONTS_REPO = "https://github.com/storytold/craft-fonts"
-OCR_CJK_REPO = "https://github.com/kent-tokyo/ocrs-cjk"
+FONTS_REPO = "storytold/craft-fonts"
+OCR_CJK_REPO = "kent-tokyo/ocrs-cjk"
 
 # Hugging Face repo holding the model; the first mirror that works is used
 HF_REPO = "marsena/paddleocr-onnx-models"
 HF_MIRRORS = ["https://hf-mirror.com", "https://huggingface.co"]
 
-# GitHub mirrors (used as a prefix); the empty string means a direct connection
-GH_MIRRORS = ["https://ghfast.top/", ""]
+# GitHub mirrors, used as a URL prefix; the empty string means a direct connection.
+# Ordered by speed as measured on 2026-10-16 from a mainland connection:
+# ghfast.top 2.4 MB/s, direct 2.3, gh.llkk.cc 1.6, gh-proxy.com 0.7, ghproxy.net 0.1.
+GH_MIRRORS = [
+    "https://ghfast.top/",
+    "",
+    "https://gh.llkk.cc/",
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+]
 
 MODEL_NAME = "PP-OCRv5_server_rec_infer.onnx"
 MODEL_SIZE = 84505505
@@ -94,7 +105,7 @@ RTEN_FROM, RTEN_TO = "0.24.0", "0.26.0"
 # The assembled application: a separate identity so it coexists with the original
 APP_NAME = "PdfCraft-zh"
 APP_ID = "ai.storyteller.pdfcraft.zh"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 ORIGINAL_ID = "ai.storyteller.pdfcraft"
 
 CODE_PATCH = r'''diff --git a/crates/edit/src/lib.rs b/crates/edit/src/lib.rs
@@ -810,9 +821,127 @@ def run(cmd, cwd: Path | None = None, capture: bool = False, check: bool = True)
     return p
 
 
-def git_url(url: str) -> str:
-    """The first usable GitHub mirror."""
-    return GH_MIRRORS[0] + url
+def _download_file(url: str, dest: Path, timeout: int = 600) -> bool:
+    """Download a whole file, resuming a partial one and retrying.
+
+    Weak networks drop long transfers, so curl's --retry together with -C -
+    (continue) is far steadier here than a git protocol exchange.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.which("curl"):
+        cmd = ["curl", "-sL", "-C", "-", "--retry", "5", "--retry-delay", "3",
+               "--connect-timeout", "30", "--max-time", str(timeout),
+               "-o", str(dest), url]
+        p = subprocess.run(cmd, capture_output=True)
+        return p.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pdfcraft-zh"})
+        with urllib.request.urlopen(req, timeout=timeout) as r, dest.open("wb") as f:
+            shutil.copyfileobj(r, f)
+        return dest.is_file() and dest.stat().st_size > 0
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def _unpack_tarball(tgz: Path, into: Path, name: str) -> Path | None:
+    """Extract a GitHub archive and return its single top-level directory."""
+    try:
+        with tarfile.open(tgz, "r:gz") as tf:
+            if sys.version_info >= (3, 12):
+                tf.extractall(into, filter="data")
+            else:
+                tf.extractall(into)
+    except (tarfile.TarError, OSError, EOFError):
+        return None
+    tops = [p for p in into.iterdir() if p.is_dir() and p.name.startswith(name + "-")]
+    return tops[0] if len(tops) == 1 else None
+
+
+def _fetch_tarball(base: str, repo: str, ref: str, dest: Path, marker: str) -> bool:
+    """One HTTP GET of GitHub's archive tarball -- the steadiest route on weak links."""
+    tgz = dest.parent / f".{dest.name}.tar.gz"
+    tgz.unlink(missing_ok=True)
+    if not _download_file(f"{base}https://github.com/{repo}/archive/{ref}.tar.gz", tgz):
+        tgz.unlink(missing_ok=True)
+        return False
+    top = _unpack_tarball(tgz, dest.parent, dest.name)
+    tgz.unlink(missing_ok=True)
+    if top is None:
+        return False
+    shutil.move(str(top), str(dest))
+    return (dest / marker).is_file()
+
+
+def _fetch_git(base: str, repo: str, ref: str, dest: Path, marker: str) -> bool:
+    """git fetch --depth 1: one exchange that carries a whole commit's tree."""
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "-q"], cwd=dest, capture=True, check=False)
+        run(["git", "remote", "add", "origin", f"{base}https://github.com/{repo}.git"],
+            cwd=dest, capture=True, check=False)
+        p = run(["git", "fetch", "-q", "--depth", "1", "origin", ref],
+                cwd=dest, capture=True, check=False)
+        if p.returncode != 0:
+            return False
+        p = run(["git", "checkout", "-q", "FETCH_HEAD"], cwd=dest, capture=True, check=False)
+        if p.returncode != 0:
+            return False
+    except OSError:
+        return False
+    return (dest / marker).is_file()
+
+
+def fetch_repo(dest: Path, repo: str, label: str, marker: str, commit: str | None = None) -> None:
+    """Put a GitHub repository at `dest`, ready to use.
+
+    Skips when `marker` is already there. Otherwise it tries every mirror in turn,
+    first with the archive tarball (one resumable HTTP GET) and then with a shallow
+    git fetch.
+
+    Whatever a failed attempt left behind is deleted before the next one starts.
+    Leaving it there is what makes a retry die with "destination path already
+    exists" and strands the user with no way forward but deleting it by hand.
+
+    `commit` pins an exact revision; without it the default branch's tip is used.
+    """
+    if (dest / marker).is_file():
+        Bar(f"Fetching {label}").finish("(already present, reusing)")
+        return
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+        print(f"  {C.warn('!')} removed an incomplete copy left by an earlier run")
+
+    attempts = []
+    for route, fetch, ref in (
+        ("tarball", _fetch_tarball, commit or "refs/heads/main"),
+        ("git",     _fetch_git,     commit or "main"),
+    ):
+        for base in GH_MIRRORS:
+            name = base.rstrip("/") or "github.com"
+            bar = Bar(f"Fetching {label}")
+            bar.tick(f"{route} via {name}")
+            ok = False
+            try:
+                ok = fetch(base, repo, ref, dest, marker)
+            except Exception:
+                ok = False
+            if ok:
+                bar.finish(f"{route} via {name}")
+                return
+            shutil.rmtree(dest, ignore_errors=True)
+            (dest.parent / f".{dest.name}.tar.gz").unlink(missing_ok=True)
+            attempts.append(f"{route} via {name}")
+
+    Bar(f"Fetching {label}").finish("every route failed")
+    die(
+        f"could not fetch {label} ({repo}).\n"
+        f"  Tried: {', '.join(attempts)}\n"
+        f"  Fetch it by hand, put it at {dest}, then run this script again:\n"
+        f"    curl -L -C - -o /tmp/{dest.name}.tar.gz \\\n"
+        f"      https://ghfast.top/https://github.com/{repo}/archive/{ref}.tar.gz\n"
+        f"    mkdir -p {dest.parent} && tar -xzf /tmp/{dest.name}.tar.gz -C {dest.parent}\n"
+        f"    mv {dest.parent}/{dest.name}-* {dest}    # unpacked dir is {dest.name}-<something>"
+    )
 
 
 def sha256_of(path: Path, bar: Bar | None = None) -> str:
@@ -1003,55 +1132,33 @@ def step_env(root: Path, jobs: int):
         die("Rust is missing; cannot build")
     print(f"  cargo: {C.info(run(['cargo', '--version'], capture=True).stdout.strip())}")
 
-    # --- pdfcraft source ---
+    # --- pdfcraft source, pinned to the revision the patch was verified against ---
     src = root / "pdfcraft"
-    bar = Bar("Fetching pdfcraft source")
-    if (src / "Cargo.toml").is_file():
-        bar.finish("(already present, reusing)")
-    else:
-        bar.tick("cloning...")
-        run(["git", "clone", "--filter=blob:none", git_url(UPSTREAM_REPO), str(src)])
-        bar.finish()
-    # pin to the verified commit so the patch is guaranteed to apply
-    head = run(["git", "rev-parse", "HEAD"], cwd=src, capture=True, check=False).stdout.strip()
-    if head != UPSTREAM_COMMIT:
-        bar2 = Bar("Switching to the verified revision")
-        run(["git", "fetch", "--depth", "1", "origin", UPSTREAM_COMMIT], cwd=src, check=False)
-        p = run(["git", "checkout", "--force", UPSTREAM_COMMIT], cwd=src, capture=True, check=False)
-        if p.returncode != 0:
-            die(f"cannot switch to {UPSTREAM_COMMIT[:10]}; run this by hand:\n  cd {src} && git fetch --depth 1 origin {UPSTREAM_COMMIT} && git checkout {UPSTREAM_COMMIT}")
-        bar2.finish(UPSTREAM_COMMIT[:10])
-    else:
-        print(f"  ✓ already at the verified revision {C.dim(UPSTREAM_COMMIT[:10])}")
+    fetch_repo(src, UPSTREAM_REPO, "pdfcraft source", "Cargo.toml", commit=UPSTREAM_COMMIT)
+    print(f"  ✓ at the verified revision {C.dim(UPSTREAM_COMMIT[:10])}")
 
     # --- craft-fonts (supplies the interface CJK font, and is a build input) ---
-    fonts = root / "craft-fonts"
-    bar = Bar("Fetching craft-fonts")
-    if (fonts / "fonts" / "manifest.txt").is_file():
-        bar.finish("(already present, reusing)")
-    else:
-        bar.tick("cloning...")
-        run(["git", "clone", "--depth", "1", git_url(FONTS_REPO), str(fonts)])
-        bar.finish()
+    fetch_repo(root / "craft-fonts", FONTS_REPO, "craft-fonts",
+               os.path.join("fonts", "manifest.txt"))
 
     # --- ocrs-cjk (the CJK OCR engine) ---
     cjk = root / "vendor" / "ocrs-cjk"
-    bar = Bar("Fetching ocrs-cjk")
-    if (cjk / "ocrs" / "Cargo.toml").is_file():
-        bar.finish("(already present, reusing)")
-    else:
-        cjk.parent.mkdir(parents=True, exist_ok=True)
-        bar.tick("cloning...")
-        run(["git", "clone", "--depth", "1", git_url(OCR_CJK_REPO), str(cjk)])
-        (cjk / ".git").exists() and shutil.rmtree(cjk / ".git", ignore_errors=True)
-        # align the rten version so it does not clash with pdfcraft's types
-        cargo = cjk / "Cargo.toml"
-        t = cargo.read_text(encoding="utf-8")
-        t = t.replace(f'rten = {{ version = "{RTEN_FROM}"', f'rten = {{ version = "{RTEN_TO}"')
-        t = t.replace(f'rten-imageproc = {{ version = "{RTEN_FROM}" }}', f'rten-imageproc = {{ version = "{RTEN_TO}" }}')
-        t = t.replace(f'rten-tensor = {{ version = "{RTEN_FROM}" }}', f'rten-tensor = {{ version = "{RTEN_TO}" }}')
+    fetch_repo(cjk, OCR_CJK_REPO, "ocrs-cjk", os.path.join("ocrs", "Cargo.toml"))
+    (cjk / ".git").exists() and shutil.rmtree(cjk / ".git", ignore_errors=True)
+    # align the rten version so it does not clash with pdfcraft's types
+    cargo = cjk / "Cargo.toml"
+    t = cargo.read_text(encoding="utf-8")
+    if RTEN_FROM in t:
+        for old, new in (
+            (f'rten = {{ version = "{RTEN_FROM}"', f'rten = {{ version = "{RTEN_TO}"'),
+            (f'rten-imageproc = {{ version = "{RTEN_FROM}" }}',
+             f'rten-imageproc = {{ version = "{RTEN_TO}" }}'),
+            (f'rten-tensor = {{ version = "{RTEN_FROM}" }}',
+             f'rten-tensor = {{ version = "{RTEN_TO}" }}'),
+        ):
+            t = t.replace(old, new)
         cargo.write_text(t, encoding="utf-8")
-        bar.finish(f"（rten {RTEN_FROM} → {RTEN_TO}）")
+        print(f"  ✓ ocrs-cjk: rten {RTEN_FROM} -> {RTEN_TO}")
 
 
 def step_assets(root: Path) -> Path:
@@ -1189,7 +1296,13 @@ def step_patch(root: Path):
     if "use ocrs_cjk as ocrs;" in probe.read_text(encoding="utf-8", errors="replace"):
         bar.finish("(already applied)")
     else:
-        p = run(["git", "apply", "--3way", str(patch_file)], cwd=src, capture=True, check=False)
+        # --3way needs a repository to fall back on: a source tree fetched as a
+        # tarball has no .git, so ask only when there is one.
+        cmd = ["git", "apply"]
+        if (src / ".git").exists():
+            cmd.append("--3way")
+        cmd.append(str(patch_file))
+        p = run(cmd, cwd=src, capture=True, check=False)
         if p.returncode != 0:
             bar.finish()
             die(f"could not apply the code patch:\n{(p.stderr or p.stdout).strip()}\n"
