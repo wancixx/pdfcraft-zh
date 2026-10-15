@@ -1,0 +1,600 @@
+diff --git a/crates/edit/src/lib.rs b/crates/edit/src/lib.rs
+index 515f17d..097bf9d 100644
+--- a/crates/edit/src/lib.rs
++++ b/crates/edit/src/lib.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: adds the CJK branch of the OCR text layer (Identity-H).
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! pdfcraft-edit — page content editing (L4). Today: page marks, Acrobat's Header & footer,
+ //! Watermark, Background and Bates numbering (execution plan M7.6).
+ //!
+@@ -295,7 +299,7 @@ fn contents(doc: &mut Document, page: &pdfcraft_model::Page) -> Result<Vec<Objec
+ }
+ 
+ /// Add the font (and an opacity state) to the page's own resources.
+-fn add_resources(doc: &mut Document, page: &pdfcraft_model::Page, opacity: Option<f64>, content: Option<&[u8]>) -> Result<(), EditError> {
++fn add_resources(doc: &mut Document, page: &pdfcraft_model::Page, opacity: Option<f64>, content: Option<&[u8]>, cjk_font: Option<&[u8]>) -> Result<(), EditError> {
+     let mut res = page.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
+     let mut fonts = res.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
+     for (name, base) in [(&b"PCHelv"[..], "Helvetica"), (b"PCTimes", "Times-Roman"), (b"PCCour", "Courier")] {
+@@ -310,6 +314,16 @@ fn add_resources(doc: &mut Document, page: &pdfcraft_model::Page, opacity: Optio
+         font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
+         fonts.set(name.to_vec(), Object::Dict(font));
+     }
++    // An OCR layer of Chinese text names `/PCCJK`: embed the CJK face once (Identity-H; `embed`
++    // builds the CIDs) and alias that resource to it, so the content stream's CIDs resolve.
++    if let Some(bytes) = cjk_font
++        && content.is_some_and(|c| c.windows(6).any(|w| w == b"/PCCJK"))
++    {
++        let full = pdfcraft_fonts::embedding::embed(doc, &mut fonts, bytes, "NotoSansCJKsc").map_err(EditError::Invalid)?;
++        if let Some(obj) = fonts.get(full.as_bytes()).cloned() {
++            fonts.set(b"PCCJK".to_vec(), obj);
++        }
++    }
+     res.set(b"Font".to_vec(), Object::Dict(fonts));
+     if let Some(o) = opacity {
+         let mut gs = res.get(b"ExtGState").map(|g| doc.resolve(g)).and_then(|g| g.as_dict().cloned()).unwrap_or_default();
+@@ -382,10 +396,10 @@ fn place_tagged(doc: &mut Document, page: &pdfcraft_model::Page, tag: &str, cont
+ /// Draw `content` on top of a page (0-based) as permanent page content, with standard Helvetica
+ /// available as `/PCHelv`. The stream is tagged `tag` (not a mark kind, so Remove never takes
+ /// it away); the original content is wrapped in q/Q first. Used for applied redaction boxes.
+-pub fn stamp(doc: &mut Document, page: usize, tag: &str, content: Vec<u8>) -> Result<(), EditError> {
++pub fn stamp(doc: &mut Document, page: usize, tag: &str, content: Vec<u8>, cjk_font: Option<&[u8]>) -> Result<(), EditError> {
+     let all = page_list(doc);
+     check(&[page], all.len())?;
+-    add_resources(doc, &all[page], None, Some(&content))?;
++    add_resources(doc, &all[page], None, Some(&content), cjk_font)?;
+     let p = page_list(doc).swap_remove(page);
+     place_tagged(doc, &p, tag, content, false)
+ }
+@@ -503,7 +517,7 @@ pub fn add_header_footer(doc: &mut Document, pages: &[usize], hf: &HeaderFooter,
+         let mut content = begin(MarkKind::HeaderFooter, "Header", page.view_matrix(doc)).into_bytes();
+         content.extend(body);
+         content.extend_from_slice(END.as_bytes());
+-        add_resources(doc, page, None, None)?;
++        add_resources(doc, page, None, None, None)?;
+         let page = &page_list(doc)[i];
+         place(doc, page, MarkKind::HeaderFooter, content, false)?;
+     }
+@@ -542,7 +556,7 @@ pub fn add_watermark(doc: &mut Document, pages: &[usize], wm: &Watermark, replac
+             content.push_str(&format!("/PCGS{} gs\n", (opacity * 100.0).round() as i64));
+             content.push_str(&picture(src, (w, h), wm.scale, wm.rotation, wm.offset));
+             content.push_str(END);
+-            add_resources(doc, &page, Some(opacity), None)?;
++            add_resources(doc, &page, Some(opacity), None, None)?;
+             add_picture_resource(doc, &page_list(doc)[i].clone(), src)?;
+             let page = &page_list(doc)[i];
+             place(doc, page, MarkKind::Watermark, content.into_bytes(), wm.behind)?;
+@@ -576,7 +590,7 @@ pub fn add_watermark(doc: &mut Document, pages: &[usize], wm: &Watermark, replac
+         }
+         content.extend_from_slice(b"ET\n");
+         content.extend_from_slice(END.as_bytes());
+-        add_resources(doc, &page, Some(opacity), None)?;
++        add_resources(doc, &page, Some(opacity), None, None)?;
+         let page = &page_list(doc)[i];
+         place(doc, page, MarkKind::Watermark, content, wm.behind)?;
+     }
+@@ -603,7 +617,7 @@ pub fn add_background(doc: &mut Document, pages: &[usize], bg: &Background, repl
+             None => content.push_str(&format!("/PCGS{} gs\n{}\n0 0 {} {} re f\n", (opacity * 100.0).round() as i64, rgb(bg.color), n(w), n(h))),
+         }
+         content.push_str(END);
+-        add_resources(doc, &page, Some(opacity), None)?;
++        add_resources(doc, &page, Some(opacity), None, None)?;
+         if let Some(src) = &bg.source {
+             add_picture_resource(doc, &page_list(doc)[i].clone(), src)?;
+         }
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 01f162a..0d5755d 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: plumbs the CJK font through to the text layer.
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! pdfcraft-engine — the façade every frontend talks to (architecture §4).
+ //!
+ //! Holds open documents, their edit history and the tool catalogue. Frontends never touch the
+@@ -2484,7 +2488,11 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) ->
+         }
+         Edit::SetDocumentScript { name, script } => pdfcraft_forms::set_document_script(doc, name, script.as_deref())?,
+         Edit::AddOcrText { page, words } => {
+-            pdfcraft_edit::stamp(doc, *page, "OCR", pdfcraft_ocr::text_layer(words))?;
++            // Chinese text needs the CJK face embedded; an all-Latin page keeps Helvetica.
++            let cjk = pdfcraft_ocr::Models::find().and_then(|m| m.cjk_font_bytes());
++            let bytes = cjk.as_deref().filter(|_| pdfcraft_ocr::needs_cjk(words));
++            let layer = pdfcraft_ocr::text_layer(words, bytes);
++            pdfcraft_edit::stamp(doc, *page, "OCR", layer, bytes)?;
+         }
+         Edit::EditPageImage { page, index, change } => {
+             let img = pdfcraft_edit::page_images(doc, *page)?
+diff --git a/crates/fonts/src/embedding.rs b/crates/fonts/src/embedding.rs
+index 84801d5..5c872ac 100644
+--- a/crates/fonts/src/embedding.rs
++++ b/crates/fonts/src/embedding.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: adds encode_identity_h() for CJK text layers.
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! Unicode embedding of an explicitly supplied, embeddable TrueType face. Font files are
+ //! document inputs or the optional craft-fonts build input, never system-interface fallbacks.
+ 
+@@ -246,6 +250,32 @@ pub fn embed_mapping(
+     Ok(resource)
+ }
+ 
++/// The Identity-H bytes for `text` drawn with a font [`embed`] embedded from `bytes`.
++///
++/// The CIDs match what `embed` assigns: each character maps to its 1-based position in the
++/// font's cmap mapping, iterated in cmap order with unmapped and glyph-0 entries skipped — the
++/// same order `embed` collects. Two-byte big-endian CIDs are what `/Encoding /Identity-H`
++/// expects. A character the font has no glyph for is an error (the caller must not draw it).
++pub fn encode_identity_h(bytes: &[u8], text: &str) -> Result<Vec<u8>, String> {
++    let font = FontRef::new(bytes).map_err(|e| e.to_string())?;
++    let mut cid_of: std::collections::HashMap<char, u16> = std::collections::HashMap::new();
++    let mut n: u32 = 0;
++    for (cp, gid) in font.charmap().mappings() {
++        if gid.to_u32() == 0 {
++            continue;
++        }
++        let Some(c) = char::from_u32(cp) else { continue };
++        n += 1;
++        cid_of.insert(c, u16::try_from(n).map_err(|_| "font mapping limit")?);
++    }
++    let mut out = Vec::with_capacity(text.len() * 2);
++    for c in text.chars() {
++        let cid = cid_of.get(&c).ok_or_else(|| format!("the font has no glyph for {c:?} (U+{:04X})", u32::from(c)))?;
++        out.extend_from_slice(&cid.to_be_bytes());
++    }
++    Ok(out)
++}
++
+ /// The decoded data of the stream `object` refers to.
+ fn stream_data(doc: &Document, object: Option<&Object>) -> Option<Vec<u8>> {
+     match doc.resolve(object?).as_ref() {
+diff --git a/crates/ocr/Cargo.toml b/crates/ocr/Cargo.toml
+index 46bb3a1..cd8ef28 100644
+--- a/crates/ocr/Cargo.toml
++++ b/crates/ocr/Cargo.toml
+@@ -1,3 +1,7 @@
++# Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++# Change: switches the OCR engine to ocrs-cjk, adds rten onnx_format.
++# Full list of changes: licenses/DERIVATION.txt in the built application.
++# Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ [package]
+ name = "pdfcraft-ocr"
+ description = "Scan & OCR: recognise text in page images (ocrs) and write it as an invisible, searchable text layer"
+@@ -12,6 +16,6 @@ workspace = true
+ 
+ [dependencies]
+ pdfcraft-fonts = { workspace = true }
+-ocrs = { version = "0.13.1", default-features = false, features = ["rten"] }
+-rten = { version = "0.26.0", default-features = false, features = ["rten_format"] }
++ocrs-cjk = { path = "/Users/wangjunwei/Desktop/pdfcraft-zh-assets/ocrs-cjk/ocrs", default-features = false, features = ["onnx"] }
++rten = { version = "0.26.0", default-features = false, features = ["rten_format", "onnx_format"] }
+ thiserror.workspace = true
+diff --git a/crates/ocr/src/lib.rs b/crates/ocr/src/lib.rs
+index 8d56fa4..c394bed 100644
+--- a/crates/ocr/src/lib.rs
++++ b/crates/ocr/src/lib.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: CJK models, alphabet file, CJK font, zh language.
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! pdfcraft-ocr — Scan & OCR ▸ Recognize text (L4).
+ //!
+ //! Recognition runs the ocrs engine (MIT/Apache-2.0) with its pre-trained models (CC-BY-SA-4.0,
+@@ -12,19 +16,46 @@
+ 
+ use std::path::{Path, PathBuf};
+ 
++// ocrs-cjk is the CJK-capable fork of ocrs: the CJK engine shares the upstream API, so the
++// alias keeps this crate's `ocrs::…` paths unchanged.
++use ocrs_cjk as ocrs;
++
+ pub use pdfcraft_fonts::helvetica_width;
+ 
+ /// The model files, as named in ATTRIBUTION.toml.
+ pub const DETECTION_MODEL: &str = "text-detection.rten";
+ pub const RECOGNITION_MODEL: &str = "text-recognition.rten";
+ 
++/// The same models under an `.onnx` name. rten picks its parser by file extension, so a
++/// PaddleOCR CJK model (ONNX bytes) must keep the `.onnx` extension: named `.rten` it would be
++/// read as an RTen file and fail to parse.
++pub const DETECTION_MODEL_ONNX: &str = "text-detection.onnx";
++pub const RECOGNITION_MODEL_ONNX: &str = "text-recognition.onnx";
++
++/// The first of `names` that exists in `dir`, so a directory may hold either the Latin (`.rten`)
++/// or the CJK (`.onnx`) pair.
++fn pick(dir: &Path, names: &[&str]) -> Option<PathBuf> {
++    names.iter().map(|n| dir.join(n)).find(|p| p.is_file())
++}
++
++/// An optional alphabet file beside the model, holding the recognition model's output classes in
++/// order (the whole file is the alphabet — PaddleOCR's `character_dict`, concatenated). A CJK
++/// model needs it: its thousands of classes cannot be listed in [`ALPHABET`]. Absent for the
++/// Latin models, which use [`ALPHABET`].
++pub const ALPHABET_FILE: &str = "alphabet.txt";
++
++/// The CJK face an OCR text layer of Chinese text is drawn in, embedded into the PDF as
++/// Identity-H. Optional: a Latin-only install has no such file and no Chinese to draw.
++pub const CJK_FONT_FILE: &str = "NotoSansCJKsc-Regular.otf";
++
+ /// The recognition model's alphabet, as it was trained (ocrs-models' `DEFAULT_ALPHABET`): its
+ /// output classes follow this order. The ocrs crate's own copy has an `E` where the training had
+ /// `€`, which made a scanned "€250" read as "E250".
+ pub const ALPHABET: &str = " 0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~€ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+ 
+-/// The languages the models read (ISO 639-1); all use the Latin alphabet without accents.
+-pub const LANGUAGES: &[(&str, &str)] = &[("en", "English")];
++/// The languages the models read (ISO 639-1). The Latin models read English; a CJK recognition
++/// model (PaddleOCR PP-OCRv5) reads Simplified and Traditional Chinese as well as English.
++pub const LANGUAGES: &[(&str, &str)] = &[("en", "English"), ("zh", "中文（简体 / 繁體）")];
+ 
+ #[derive(Debug, thiserror::Error)]
+ pub enum OcrError {
+@@ -40,20 +71,34 @@ pub enum OcrError {
+     EmptyImage,
+ }
+ 
+-/// Where the two model files are.
++/// Where the model files are, and the alphabet beside them when the model needs one.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct Models {
+     pub detection: PathBuf,
+     pub recognition: PathBuf,
++    /// A CJK model's `character_dict` (see [`ALPHABET_FILE`]); `None` for the Latin models.
++    pub alphabet: Option<PathBuf>,
++    /// The CJK face for a Chinese text layer (see [`CJK_FONT_FILE`]); `None` without it.
++    pub cjk_font: Option<PathBuf>,
+ }
+ 
+ impl Models {
+-    /// The models in `dir`, if both files are there.
++    /// The models in `dir`, if both model files are there.
+     pub fn in_dir(dir: &Path) -> Option<Models> {
+-        let m = Models { detection: dir.join(DETECTION_MODEL), recognition: dir.join(RECOGNITION_MODEL) };
++        let m = Models {
++            detection: pick(dir, &[DETECTION_MODEL, DETECTION_MODEL_ONNX])?,
++            recognition: pick(dir, &[RECOGNITION_MODEL, RECOGNITION_MODEL_ONNX])?,
++            alphabet: Some(dir.join(ALPHABET_FILE)).filter(|p| p.is_file()),
++            cjk_font: Some(dir.join(CJK_FONT_FILE)).filter(|p| p.is_file()),
++        };
+         (m.detection.is_file() && m.recognition.is_file()).then_some(m)
+     }
+ 
++    /// The bytes of the CJK face, if one is installed beside the models.
++    pub fn cjk_font_bytes(&self) -> Option<Vec<u8>> {
++        std::fs::read(self.cjk_font.as_ref()?).ok()
++    }
++
+     /// Look for the models: `$PDFCRAFT_MODELS`, then where the release packages install them
+     /// beside the executable ([`Models::dirs_beside_exe`]), then the source tree's `assets/models/`.
+     pub fn find() -> Option<Models> {
+@@ -111,10 +156,16 @@ pub struct Ocr {
+ impl Ocr {
+     pub fn load(models: &Models) -> Result<Ocr, OcrError> {
+         let load = |p: &Path| rten::Model::load_file(p).map_err(|e| OcrError::Load(p.display().to_string(), e.to_string()));
++        // A CJK model carries its own alphabet (thousands of classes); the Latin models use the
++        // alphabet they were trained with.
++        let alphabet = match &models.alphabet {
++            Some(p) => std::fs::read_to_string(p).map_err(|e| OcrError::Load(p.display().to_string(), e.to_string()))?,
++            None => ALPHABET.into(),
++        };
+         let params = ocrs::OcrEngineParams {
+             detection_model: Some(load(&models.detection)?),
+             recognition_model: Some(load(&models.recognition)?),
+-            alphabet: Some(ALPHABET.into()),
++            alphabet: Some(alphabet),
+             ..Default::default()
+         };
+         let engine = ocrs::OcrEngine::new(params).map_err(|e| OcrError::Load("ocr engine".into(), e.to_string()))?;
+@@ -211,13 +262,23 @@ fn num(v: f64) -> String {
+     if s == "-0" { "0".into() } else { s.into() }
+ }
+ 
++/// Whether `words` need the CJK face: any character the standard WinAnsi fonts cannot hold.
++/// The caller passes the CJK font only when this is true.
++pub fn needs_cjk(words: &[PlacedWord]) -> bool {
++    words.iter().any(|w| w.text.chars().any(|c| !pdfcraft_fonts::win_ansi_encodable(c)))
++}
++
+ /// Page content that writes `words` as invisible text in `/PCHelv` (standard Helvetica,
+ /// WinAnsiEncoding), each word stretched to its box so selection and search highlight the
+ /// right place. Marked content `/OCR` so it can be told apart from the page's own text.
+-pub fn text_layer(words: &[PlacedWord]) -> Vec<u8> {
+-    let mut out = b"/OCR BMC\nBT\n3 Tr\n/PCHelv 1 Tf\n".to_vec();
++pub fn text_layer(words: &[PlacedWord], cjk: Option<&[u8]>) -> Vec<u8> {
++    // A CJK model's words go into the embedded CJK face as Identity-H (two-byte CIDs); the Latin
++    // models keep the standard `/PCHelv` Helvetica with WinAnsiEncoding. `/PCCJK` is the resource
++    // name the caller installs when it passes `cjk`.
++    let resource = if cjk.is_some() { "/PCCJK" } else { "/PCHelv" };
++    let mut out = format!("/OCR BMC\nBT\n3 Tr\n{resource} 1 Tf\n").into_bytes();
+     for w in words {
+-        let width = helvetica_width(&w.text, 1.0);
++        let width = if cjk.is_some() { pdfcraft_fonts::cjk_width(&w.text, 1.0) } else { helvetica_width(&w.text, 1.0) };
+         let height = w.up[0].hypot(w.up[1]);
+         if width <= 0.0 || height <= 0.0 {
+             continue;
+@@ -232,8 +293,22 @@ pub fn text_layer(words: &[PlacedWord]) -> Vec<u8> {
+         let nums: Vec<String> = m.iter().map(|v| num(*v)).collect();
+         out.extend_from_slice(nums.join(" ").as_bytes());
+         out.extend_from_slice(b" Tm ");
+-        out.extend(pdfcraft_fonts::literal(&pdfcraft_fonts::win_ansi(&w.text)));
+-        out.extend_from_slice(b" Tj\n");
++        match cjk {
++            Some(bytes) => {
++                // Identity-H draws two-byte CIDs; a hex string carries them. A word the font
++                // cannot show is left out rather than drawn as garbage.
++                if let Ok(cids) = pdfcraft_fonts::embedding::encode_identity_h(bytes, &w.text) {
++                    let hex: String = cids.iter().map(|b| format!("{b:02X}")).collect();
++                    out.extend_from_slice(format!("<{hex}> Tj\n").as_bytes());
++                } else {
++                    out.extend_from_slice(b"() Tj\n");
++                }
++            }
++            None => {
++                out.extend(pdfcraft_fonts::literal(&pdfcraft_fonts::win_ansi(&w.text)));
++                out.extend_from_slice(b" Tj\n");
++            }
++        }
+     }
+     out.extend_from_slice(b"ET\nEMC\n");
+     out
+diff --git a/crates/redact/src/lib.rs b/crates/redact/src/lib.rs
+index 61231bd..58a0c08 100644
+--- a/crates/redact/src/lib.rs
++++ b/crates/redact/src/lib.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: keeps redaction consistent with the CJK text layer.
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! Redaction (architecture §11.2, execution plan M8.5–M8.7). Layer L4.
+ //!
+ //! Content is marked for redaction with Redact annotations (§12.5.6.23); `pdfcraft-annot`
+@@ -481,7 +485,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
+     // 4. The boxes.
+     for (pi, content) in overlays {
+         if !content.is_empty() {
+-            pdfcraft_edit::stamp(doc, pi, "Redaction", content)?;
++            pdfcraft_edit::stamp(doc, pi, "Redaction", content, None)?;
+         }
+     }
+ 
+diff --git a/crates/ui-egui/src/i18n/mod.rs b/crates/ui-egui/src/i18n/mod.rs
+index 5bb2889..af07908 100644
+--- a/crates/ui-egui/src/i18n/mod.rs
++++ b/crates/ui-egui/src/i18n/mod.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: reduces the interface to four languages.
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! UI localisation. Strings in code stay English and are the default lookup keys; a per-language
+ //! catalog (`*.tsv`, see `ja.tsv` for the format) maps them to display text at render time. Command
+ //! ids, document text, file names, the control channel, the CLI and MCP never see translated text,
+@@ -58,96 +62,17 @@ fn plural_none(_: u64) -> usize {
+     0
+ }
+ 
+-/// Lithuanian: one (ending in 1 except 11), few (ending in 2–9 except 12–19), other otherwise.
+-fn plural_lithuanian(n: u64) -> usize {
+-    match (n % 10, n % 100) {
+-        (1, 11) => 2,
+-        (1, _) => 0,
+-        (2..=9, 12..=19) => 2,
+-        (2..=9, _) => 1,
+-        _ => 2,
+-    }
+-}
+ 
+-/// Czech: 1 → one, 2–4 → few, everything else (0, 5+) → other.
+-fn plural_cs(n: u64) -> usize {
+-    match n {
+-        1 => 0,
+-        2..=4 => 1,
+-        _ => 2,
+-    }
+-}
+ 
+-/// Portuguese: 0 and 1 take the singular, everything else the plural.
+-fn plural_pt(n: u64) -> usize {
+-    usize::from(n > 1)
+-}
+ 
+-/// French (CLDR `fr`): 0 and 1 take the singular, everything else the plural.
+-fn plural_fr(n: u64) -> usize {
+-    usize::from(n > 1)
+-}
+ 
+-/// Russian: 1 (but not 11) is `one`, 2–4 (but not 12–14) `few`, everything else `many`.
+-fn plural_russian(n: u64) -> usize {
+-    match n % 100 {
+-        11..=14 => 2,
+-        _ => match n % 10 {
+-            1 => 0,
+-            2..=4 => 1,
+-            _ => 2,
+-        },
+-    }
+-}
+ 
+-/// Ukrainian (CLDR `uk`, integer counts): one (1, 21), few (2–4, 22–24), many (0, 5–19).
+-/// Counts ending in 11–14 always take many, regardless of the last digit.
+-fn plural_ukrainian(n: u64) -> usize {
+-    match n % 100 {
+-        11..=14 => 2,
+-        _ => match n % 10 {
+-            1 => 0,
+-            2..=4 => 1,
+-            _ => 2,
+-        },
+-    }
+-}
+ 
+-/// Arabic (CLDR `ar`, integer counts): zero (0), one (1), two (2), few (3–10, 103–110),
+-/// many (11–99, 111–199), other (100–102, 200–202).
+-fn plural_arabic(n: u64) -> usize {
+-    match (n, n % 100) {
+-        (0, _) => 0,
+-        (1, _) => 1,
+-        (2, _) => 2,
+-        (_, 3..=10) => 3,
+-        (_, 11..=99) => 4,
+-        _ => 5,
+-    }
+-}
+ 
+-/// Polish integer counts: 1 is one; endings 2–4 except 12–14 are few; the rest are many.
+-fn plural_polish(n: u64) -> usize {
+-    match (n, n % 100, n % 10) {
+-        (1, _, _) => 0,
+-        (_, 12..=14, _) => 2,
+-        (_, _, 2..=4) => 1,
+-        _ => 2,
+-    }
+-}
+ 
+-/// Slovene (CLDR `sl`): one (1, 101, 201 ...) | two (2, 102 ...) | few (3, 4, 103 ...) | other.
+-fn plural_sl(n: u64) -> usize {
+-    match n % 100 {
+-        1 => 0,
+-        2 => 1,
+-        3 | 4 => 2,
+-        _ => 3,
+-    }
+-}
+ 
+ /// The registry. English first: it is the fallback and the source language.
+-pub static LANGUAGES: [LangInfo; 23] = [
++pub static LANGUAGES: [LangInfo; 4] = [
+     LangInfo { code: "en", name: "English", source: "", plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+     LangInfo { code: "ja", name: "日本語", source: include_str!("ja.tsv"), plural: plural_none, rtl: false, catalog: OnceLock::new() },
+     // Simplified Chinese; `zh`, `zh-CN`, `zh-SG` and `zh-Hans-*` locales resolve here (see `candidates`).
+@@ -159,57 +84,6 @@ pub static LANGUAGES: [LangInfo; 23] = [
+     LangInfo {
+         code: "zh-hant", name: "繁體中文", source: include_str!("zh-hant.tsv"), plural: plural_none, rtl: false, catalog: OnceLock::new()
+     },
+-    LangInfo { code: "cs", name: "Čeština", source: include_str!("cs.tsv"), plural: plural_cs, rtl: false, catalog: OnceLock::new() },
+-    // Brazilian Portuguese; `pt`, `pt-BR` and `pt-PT` locales all resolve here (see `candidates`).
+-    LangInfo {
+-        code: "pt-br",
+-        name: "Português (Brasil)",
+-        source: include_str!("pt-br.tsv"),
+-        plural: plural_pt,
+-        rtl: false,
+-        catalog: OnceLock::new(),
+-    },
+-    // German (informal "du"); every `de-*` locale (`de-DE`, `de-AT`, `de-CH` ...) resolves here.
+-    LangInfo { code: "de", name: "Deutsch", source: include_str!("de.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // Spanish (European vocabulary); every `es-*` locale (`es-ES`, `es-MX`, `es-419` ...) resolves here.
+-    LangInfo { code: "es", name: "Español", source: include_str!("es.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // French; every `fr-*` locale (`fr-FR`, `fr-CA`, `fr-BE` ...) resolves here.
+-    LangInfo { code: "fr", name: "Français", source: include_str!("fr.tsv"), plural: plural_fr, rtl: false, catalog: OnceLock::new() },
+-    // Russian; every `ru-*` locale (`ru-RU`, `ru-BY`, `ru-KZ` ...) resolves here.
+-    LangInfo { code: "ru", name: "Русский", source: include_str!("ru.tsv"), plural: plural_russian, rtl: false, catalog: OnceLock::new() },
+-    // Kazakh; every `kk-*` locale (`kk-KZ`, `kk-KZ.UTF-8`) resolves here.
+-    LangInfo { code: "kk", name: "Қазақша", source: include_str!("kk.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // Bulgarian; every `bg-*` locale (`bg-BG`) resolves here.
+-    LangInfo {
+-        code: "bg", name: "Български", source: include_str!("bg.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new()
+-    },
+-    // Telugu; every `te-*` locale (`te-IN`) resolves here.
+-    LangInfo {
+-        code: "te", name: "తెలుగు", source: include_str!("te.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new()
+-    },
+-    // Hungarian; every `hu-*` locale (`hu-HU`) resolves here.
+-    LangInfo { code: "hu", name: "Magyar", source: include_str!("hu.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // Ukrainian; every `uk-*` locale (`uk-UA`, `uk_UA.UTF-8`) resolves here.
+-    LangInfo {
+-        code: "uk", name: "Українська", source: include_str!("uk.tsv"), plural: plural_ukrainian, rtl: false, catalog: OnceLock::new()
+-    },
+-    // Italian; every `it-*` locale (`it-IT`) resolves here.
+-    LangInfo { code: "it", name: "Italiano", source: include_str!("it.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // Arabic (Modern Standard, Western digits); every `ar-*` locale (`ar-MA`, `ar-EG`, `ar-SA` ...)
+-    // resolves here. Right to left: see `LangInfo::rtl`.
+-    LangInfo { code: "ar", name: "العربية", source: include_str!("ar.tsv"), plural: plural_arabic, rtl: true, catalog: OnceLock::new() },
+-    // Polish; every `pl-*` locale (`pl-pl`, `pl_pl.UTF-8`) resolves here.
+-    LangInfo { code: "pl", name: "Polski", source: include_str!("pl.tsv"), plural: plural_polish, rtl: false, catalog: OnceLock::new() },
+-    // Slovene; every `sl-*` locale (`sl-SI`) resolves here. Four plural forms (one, two, few, other).
+-    LangInfo { code: "sl", name: "Slovenščina", source: include_str!("sl.tsv"), plural: plural_sl, rtl: false, catalog: OnceLock::new() },
+-    LangInfo { code: "el", name: "Ελληνικά", source: include_str!("el.tsv"), plural: plural_one_other, rtl: false, catalog: OnceLock::new() },
+-    // Turkish; every `tr-*` locale (`tr-TR`, `tr_TR.UTF-8`) resolves here.
+-    LangInfo { code: "tr", name: "Türkçe", source: include_str!("tr.tsv"), plural: plural_none, rtl: false, catalog: OnceLock::new() },
+-    // Lithuanian; every `lt-*` locale (`lt-LT`, `lt_LT.UTF-8`) resolves here. Three plural forms (one, few, other).
+-    LangInfo { code: "lt", name: "Lietuvių", source: include_str!("lt.tsv"), plural: plural_lithuanian, rtl: false, catalog: OnceLock::new() },
+-    // Vietnamese; every `vi-*` locale (`vi-VN`, `vi_VN.UTF-8`) resolves here. CLDR `vi` counts have
+-    // one form ("other"), so `@plural` entries list a single form.
+-    LangInfo { code: "vi", name: "Tiếng Việt", source: include_str!("vi.tsv"), plural: plural_none, rtl: false, catalog: OnceLock::new() },
+ ];
+ 
+ impl LangInfo {
+@@ -312,10 +186,6 @@ fn candidates(tag: &str) -> Vec<String> {
+         let script = if parts.iter().any(|p| matches!(*p, "tw" | "hk" | "mo")) { "zh-hant" } else { "zh-hans" };
+         out.insert(out.len().saturating_sub(1), script.to_string());
+     }
+-    if primary == "pt" && !out.iter().any(|c| c == "pt-br") {
+-        // The only Portuguese catalog is Brazilian; other regions use it rather than English.
+-        out.insert(out.len().saturating_sub(1), "pt-br".to_string());
+-    }
+     out
+ }
+ 
+diff --git a/crates/ui-egui/src/system_fonts.rs b/crates/ui-egui/src/system_fonts.rs
+index 606fa92..f35e69c 100644
+--- a/crates/ui-egui/src/system_fonts.rs
++++ b/crates/ui-egui/src/system_fonts.rs
+@@ -1,3 +1,7 @@
++// Modified by pdfcraft-zh — a Chinese-localisation patch of PdfCraft.
++// Change: uses the system CJK face (PingFang on macOS 15+).
++// Full list of changes: licenses/DERIVATION.txt in the built application.
++// Upstream: https://github.com/storytold/pdfcraft (MIT OR Apache-2.0).
+ //! The last-resort interface font: one face already installed on this machine.
+ //!
+ //! The embedded faces (Inter, egui's defaults, craft-fonts) come first in every family; this one
+@@ -256,6 +260,18 @@ fn other_candidates() -> Vec<PathBuf> {
+     }
+ }
+ 
++/// PingFang in the macOS 15 MobileAsset store. Before macOS 15 the face lives at
++/// `/System/Library/Fonts/PingFang.ttc`; 15 moved it under `/System/Library/AssetsV2`, whose
++/// directories are content-hashed, so it has to be found rather than named. Copying the file
++/// into the app is not an option (Apple's licence), but reading the installed one is.
++fn pingfang_in_mobile_assets() -> Option<PathBuf> {
++    let dir = Path::new("/System/Library/AssetsV2/com_apple_MobileAsset_Font7");
++    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
++        let candidate = entry.path().join("AssetData").join("PingFang.ttc");
++        candidate.is_file().then_some(candidate)
++    })
++}
++
+ /// Chinese sans faces the operating system ships, the UI language's own region first. Noto CJK
+ /// and Source Han are left out on purpose (AGENTS.md §1.1).
+ fn han_candidates(traditional: bool) -> Vec<PathBuf> {
+@@ -266,11 +282,18 @@ fn han_candidates(traditional: bool) -> Vec<PathBuf> {
+         files.iter().map(|f| windows_fonts().join(f)).collect()
+     } else if cfg!(target_os = "macos") {
+         let files: &[&str] = if traditional {
+-            &["PingFang.ttc", "STHeiti Light.ttc", "STHeiti Medium.ttc", "Hiragino Sans GB.ttc"]
++            &["STHeiti Light.ttc", "STHeiti Medium.ttc", "Hiragino Sans GB.ttc"]
+         } else {
+-            &["PingFang.ttc", "Hiragino Sans GB.ttc", "STHeiti Light.ttc", "STHeiti Medium.ttc"]
++            // Simplified Chinese: prefer STHeiti Medium (a Simplified sans with body weight)
++            // over Hiragino Sans GB, whose light Japanese-style glyphs read as a different,
++            // thinner face and mix awkwardly with Latin.
++            &["STHeiti Medium.ttc", "STHeiti Light.ttc", "Hiragino Sans GB.ttc"]
+         };
+-        files.iter().map(|f| Path::new("/System/Library/Fonts").join(f)).collect()
++        // PingFang first: the pre-15 path, then the macOS 15 MobileAsset store it moved to.
++        let mut out = vec![Path::new("/System/Library/Fonts/PingFang.ttc").to_path_buf()];
++        out.extend(pingfang_in_mobile_assets());
++        out.extend(files.iter().map(|f| Path::new("/System/Library/Fonts").join(f)));
++        out
+     } else {
+         unix_fonts(&[
+             "truetype/wqy/wqy-microhei.ttc",
